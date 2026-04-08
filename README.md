@@ -1,13 +1,37 @@
-# Render loop regression — @tanstack/react-router >= 1.168.0
+# Render loop — `@tanstack/react-router` >= 1.168.0 + custom `useSyncExternalStoreWithSelector` shim
 
-Minimal reproduction of an infinite render loop introduced by the signal-based reactivity refactor (PR #6704, released in `@tanstack/react-router@1.168.0`).
+Minimal reproduction of an infinite render loop triggered by upgrading `@tanstack/react-router` from `1.167.x` to `>= 1.168.0`.
+
+## Root cause
+
+Starting from `1.168.0` (PR [#6704](https://github.com/TanStack/router/pull/6704)), `@tanstack/react-router` moved to signal-based reactivity via `@tanstack/react-store`, which internally uses `useSyncExternalStoreWithSelector` from `use-sync-external-store/shim/with-selector`.
+
+Our project aliases `use-sync-external-store/shim` to a custom shim that re-exports React 19's native `useSyncExternalStore` (avoiding the polyfill). The `with-selector` portion of the shim has a subtle bug — it calls `setState` during render to track the previous value for equality comparison:
+
+```js
+// src/shim/with-selector/with-selector.js (buggy)
+const selected = useSyncExternalStore(subscribe, getSelectedSnapshot);
+const [state, setState] = useState(selected);
+if (!isEqual?.(state, selected)) {
+  setState(selected); // ← setState during render
+}
+return state;
+```
+
+When a store selector produces a **new reference** on every `getSnapshot()` call (which happens with the new computed atoms/stores in `@tanstack/react-store`), this creates an infinite loop:
+
+1. Render → `getSelectedSnapshot()` returns new reference
+2. `selected !== state` → `setState(selected)` during render
+3. Re-render → `getSelectedSnapshot()` returns yet another new reference
+4. `selected !== state` → `setState(selected)` again → **∞ loop**
+
+On `1.167.x` this never triggered because the router did **not** use `@tanstack/react-store` / `useStore` — it subscribed to router state through a different mechanism that didn't go through `useSyncExternalStoreWithSelector`.
 
 ## Environment
 
 | Dependency | Version |
 |---|---|
-| `@tanstack/react-router` | **1.168.10** (bug) / **1.167.4** (works) |
-| `@tanstack/react-query` | 5.96.2 |
+| `@tanstack/react-router` | **1.168.10** (broken) / **1.167.4** (works) |
 | `react` | 19.2.4 |
 | `vite` | 8.0.7 |
 
@@ -18,7 +42,7 @@ pnpm install
 pnpm dev
 ```
 
-Open the browser — the app will immediately enter an infinite render loop. The page either freezes, shows a blank screen, or shows `Maximum update depth exceeded` in the console.
+Open the browser — the app enters an infinite render loop (blank screen or `Maximum update depth exceeded`).
 
 ### Confirm fix by downgrading
 
@@ -27,53 +51,25 @@ pnpm add @tanstack/react-router@1.167.4
 pnpm dev
 ```
 
-The app works normally on `1.167.4`.
+Works normally.
 
-## What triggers the loop
+### Alternative fix — remove the alias
 
-The combination of the following patterns causes the loop after the signal-based reactivity refactor:
-
-1. **`HeadContent`** in the root route — subscribes to head meta from all matched routes
-2. **`head()` on child routes** reading `match.fullPath` — becomes signal-reactive in 1.168.0
-3. **`useMatches()` without a selector** — subscribes to the full `activeMatchesSnapshot` computed store, which rebuilds on every match store change
-4. **`beforeLoad` with `throw redirect()`** — triggers navigation state changes that propagate through all computed stores
-5. **`loader` calling `queryClient.ensureQueryData()`** (fire-and-forget) — causes match state updates during the loading phase
-6. **React 19 `StrictMode`** — double-invokes effects, exacerbating timing issues with the new batch/flush mechanism
-7. **`defaultStructuralSharing: true`** — `replaceEqualDeep` receives new array references from recomputed stores, failing to deduplicate
-8. **`defaultViewTransition: true`** — view transition reads snapshot during pending state
-
-### Signal propagation chain (simplified)
-
-```
-location store update
-  → matchRouteReactivity recomputes (depends on location + status)
-  → activeMatchesSnapshot recomputes (depends on matchesId + match stores)
-  → useMatches() sees new reference → Sidebar re-renders
-  → HeadContent sees new head() output → re-renders
-  → Match component re-subscribes to match store
-  → match store has pending loader → Suspense throws
-  → Suspense fallback → re-triggers navigation
-  → loop
-```
+Remove the `use-sync-external-store/shim` alias from `vite.config.ts`. The bundled polyfill from `use-sync-external-store` has a correct `useSyncExternalStoreWithSelector` implementation that caches selector results in refs instead of calling `setState` during render.
 
 ## Project structure
 
 ```
 src/
-├── main.tsx                     # createRouter with structural sharing + view transitions
+├── main.tsx                 # Minimal router setup with StrictMode
+├── shim/                    # Custom useSyncExternalStore shim (the bug)
+│   ├── index.js
+│   ├── with-selector.js
+│   └── with-selector/
+│       ├── index.js
+│       └── with-selector.js # ← buggy useSyncExternalStoreWithSelector
 ├── routes/
-│   ├── __root.tsx               # HeadContent + root head()
-│   ├── index.tsx                # Redirects / → /dashboard
-│   ├── login.tsx                # Login page with search params
-│   └── _auth/
-│       ├── route.tsx            # Layout with beforeLoad redirect + loader + useMatches() sidebar
-│       └── dashboard.tsx        # useSuspenseQuery + head()
+│   ├── __root.tsx           # HeadContent + Outlet
+│   └── index.tsx            # Simple home page
+└── routeTree.gen.ts
 ```
-
-## Expected behavior
-
-The app should render without entering an infinite loop, same as `1.167.4`.
-
-## Actual behavior
-
-Infinite render loop starting from `1.168.0` onwards (tested up to `1.168.10`).
